@@ -7,8 +7,8 @@ def main(libvortekrenderer):
     VortekRendererComponent_createVkContext, we'll do the following instead:
 
     1. Rename VortekRendererComponent_createVkContext to old_VortekRendererComponent_createVkContext
-    2. Have libvortekpatch.so export the original symbol (so that it gets called instead of libvortekrenderer)
-    3. Add libvortekpatch.so as a DT_NEEDED library so it gets loaded with libvortekrenderer.so
+    2. Have libvortekpatcher.so export the original symbol (so that it gets called instead of libvortekrenderer)
+    3. Add libvortekpatcher.so as a DT_NEEDED library so it gets loaded with libvortekrenderer.so
     '''
     if not os.path.exists(libvortekrenderer):
         raise Exception(f"{libvortekrenderer} does not exist")
@@ -24,8 +24,8 @@ def main(libvortekrenderer):
             sym.name = "old_" + sym.name
             break
 
-    print("Adding libvortekpatch.so to DT_NEEDED")
-    binary.add_library("libvortekpatch.so")
+    print("Adding libvortekpatcher.so to DT_NEEDED")
+    binary.add_library("libvortekpatcher.so")
     binary.write(libvortekrenderer + ".new")
 
 if __name__ == "__main__":
