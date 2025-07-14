@@ -13,9 +13,6 @@
 #include <sstream>
 #include <sys/mman.h>
 
-#define BGR 1;
-#include "bcdec.h"
-
 const char* get_vulkan_call_name(int command_id) {
     switch (command_id) {
         case 0x67: return "vkGetPhysicalDeviceProperties";
@@ -243,9 +240,15 @@ extern "C" int __system_property_get(const char *name, char *value);
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-int is_enabled(const char* property) {
-    char value[92] = { 0 };
-    return __system_property_get(property, value) > 0;
+int is_enabled(const char* property, const char* env) {
+    char value[256] = { 0 };
+    if (__system_property_get(property, value) > 0) {
+        return true;
+    }
+    const char* env_value = getenv(env);
+    LOGI("is_enabled flag:%s, value:%s", env, env_value);
+    if (!env_value) return false;
+    return *env_value == '1';
 }
 
 typedef struct { char _p[0x27]; void* task_queue; } TextureDecoder;
@@ -316,124 +319,15 @@ static void (*TextureDecoder_copyBufferToImage)(void*, VkCommandBuffer          
 static ArrayDeque image_regions;
 
 void* my_getHandleRequestFunc(unsigned short op) {
-    if (op == 0x147 || op == 0xbf || op == 0xd8)
-        LOGI("Handling command: %d (%s)", op, get_vulkan_call_name(op));
+    // if (op == 0x147 || op == 0xbf || op == 0xd8)
+    LOGI("Handling command: %d (%s)", op, get_vulkan_call_name(op));
     return original_getHandleRequestFunc(op);
-}
-
-extern "C"
-void my_vt_handle_vkCmdCopyBufferToImage(uint64_t command_context) {
-    char* command_data = *(char**)(command_context + 0x50);
-
-    // Parse command buffer handle
-    uint64_t command_buffer_id;
-    size_t offset;
-    if (*command_data == 0) {
-        // Direct parameter
-        command_buffer_id = command_context;
-        offset = 1;
-    } else {
-        // Indirect parameter
-        command_buffer_id = *(uint64_t*)(command_data + 1);
-        offset = 9;
-    }
-
-    // Parse source buffer handle
-    uint64_t src_buffer_id = 0;
-    if (command_data[offset] != 0) {
-        src_buffer_id = *(uint64_t*)(command_data + offset + 1);
-        offset += 9;
-    } else {
-        offset += 1;
-    }
-
-    // Parse destination image handle
-    uint64_t dst_image_id = 0;
-    if (command_data[offset] != 0) {
-        dst_image_id = *(uint64_t*)(command_data + offset + 1);
-        offset += 9;
-    } else {
-        offset += 1;
-    }
-
-    // Parse image layout and region count
-    uint32_t image_layout = *(uint32_t*)(command_data + offset);
-    offset += 4;
-    uint32_t region_count = *(uint32_t*)(command_data + offset + 4);
-    offset += 4;
-    size_t regions_offset = offset;
-
-    // Convert handles to VkObjects
-    uint64_t vk_command_buffer = (uint64_t) VkObject_fromId((void*) command_buffer_id);
-    uint64_t vk_src_buffer = (uint64_t) VkObject_fromId((void*) src_buffer_id);
-    uint64_t vk_dst_image = (uint64_t) VkObject_fromId((void*) dst_image_id);
-
-    // Check if we should use texture decoder or original Vulkan function
-    uint64_t texture_decoder = *(uint64_t*)(command_context + 0x90);
-
-    // Allocate stack space for regions array
-    size_t regions_size = (region_count * sizeof(VkBufferImageCopy) + 15) & ~15;;
-    VkBufferImageCopy* regions = (VkBufferImageCopy*)alloca(regions_size);
-
-    // Copy regions data from command buffer to stack
-    if (region_count > 0) {
-        // There's a second regionCount because pRegions is an array, skip it
-        size_t current_offset = regions_offset + 4; // Skip initial size field
-
-        for (uint32_t i = 0; i < region_count; i++) {
-            // Read region size and advance pointer
-            uint32_t region_size = *(uint32_t*)(command_data + current_offset);
-            char* region_data = command_data + current_offset + 4;
-            current_offset += region_size;
-
-            // Copy VkBufferImageCopy structure (56 bytes = 0x38)
-            regions[i].bufferOffset = *(uint64_t*)(region_data + 0x00);
-            regions[i].bufferRowLength = *(uint32_t*)(region_data + 0x08);
-            regions[i].bufferImageHeight = *(uint32_t*)(region_data + 0x0C);
-            regions[i].imageSubresource.aspectMask = *(uint32_t*)(region_data + 0x10);
-            regions[i].imageSubresource.mipLevel = *(uint32_t*)(region_data + 0x14);
-            regions[i].imageSubresource.baseArrayLayer = *(uint32_t*)(region_data + 0x18);
-            regions[i].imageSubresource.layerCount = *(uint32_t*)(region_data + 0x1C);
-            regions[i].imageOffset.x = *(int32_t*)(region_data + 0x20);
-            regions[i].imageOffset.y = *(int32_t*)(region_data + 0x24);
-            regions[i].imageOffset.z = *(int32_t*)(region_data + 0x28);
-            regions[i].imageExtent.width = *(uint32_t*)(region_data + 0x2C);
-            regions[i].imageExtent.height = *(uint32_t*)(region_data + 0x30);
-            regions[i].imageExtent.depth = *(uint32_t*)(region_data + 0x34);
-        }
-    }
-
-    if (texture_decoder == 0 ||
-        !TextureDecoder_containsImage((void*) texture_decoder, (VkImage) vk_dst_image)) {
-        // Use original Vulkan function
-        vkCmdCopyBufferToImage((VkCommandBuffer) vk_command_buffer, (VkBuffer) vk_src_buffer, (VkImage) vk_dst_image,
-                               (VkImageLayout) image_layout, region_count, regions);
-    } else {
-        // Use custom texture decoder (only if buffer offset is 0)
-        if (region_count > 0) {
-            VkBufferImageCopy* region_copy = (VkBufferImageCopy*)malloc(regions_size);
-            memcpy(region_copy, regions, regions_size);
-            ArrayDeque_addLast(&image_regions, region_copy);
-        } else {
-            LOGE("    Adding region_null");
-            ArrayDeque_addLast(&image_regions, nullptr);
-        }
-        TextureDecoder_copyBufferToImage((void*) texture_decoder, (VkCommandBuffer) vk_command_buffer, (VkBuffer) vk_src_buffer, (VkImage) vk_dst_image,
-                                         (VkImageLayout) image_layout);
-
-    }
-}
-
-extern "C"
-void my_vt_handle_vkCmdCopyBufferToImage2(void* ctx) {
-    LOGE("Inside vt_handle_vkCmdCopyBufferToImage2");
-    original_vt_handle_vkCmdCopyBufferToImage2(ctx);
 }
 
 extern "C"
 void my_vt_handle_vkEndCommandBuffer(void* ctx) {
     // Log every command on the buffer
-    LOGI("Inside vt_handle_vkEndCommandBuffer");
+    // LOGI("Inside vt_handle_vkEndCommandBuffer");
 #define GET(x) (*(void**)(x))
     char* context = (char*) ctx;
     uint8_t* commandBuffer = (uint8_t*) GET(context + 0x50);  // offset 0x50
@@ -461,117 +355,6 @@ void my_vt_handle_vkEndCommandBuffer(void* ctx) {
 
 #define TASK_QUEUE(self) (&((char*)self)[0x28])
 #define TASK_DEVICE(self) (*(VkDevice*)&((char*)self)[0x00])
-
-extern "C"
-void my_TextureDecoder_decodeAll(void* self) {
-    if (!ArrayDeque_isEmpty(TASK_QUEUE(self)))
-        LOGI("In TextureDecoder_decodeAll");
-
-    while (!ArrayDeque_isEmpty(TASK_QUEUE(self))) {
-        DecodingTask* task = (DecodingTask*) ArrayDeque_removeFirst(TASK_QUEUE(self));
-        VkBufferImageCopy* regions = nullptr;
-        if (!ArrayDeque_isEmpty(&image_regions)) {
-            regions = (VkBufferImageCopy*) ArrayDeque_removeFirst(&image_regions);
-        } else {
-            LOGE("Missing pRegions");
-            continue;
-        }
-        LOGI("  + Task = %p (src=%p, dst=%p)", task, task->data_source, task->image_params);
-        LOGI("    dst->format = %d", task->image_params->format - 131);
-        if (regions) {
-            LOGI("    offset=%lx, rowLen=%d, imgHeight=%d", regions->bufferOffset,
-                 regions->bufferRowLength, regions->bufferImageHeight);
-        } else {
-            LOGE("Encountered nullptr for pRegions");
-            continue;
-        }
-
-        void* mappedSrcBase = mmap(
-                NULL,
-                task->data_source->mmap_details->length,
-                PROT_READ,
-                MAP_SHARED,
-                task->data_source->mmap_details->fd, 0);
-        if (mappedSrcBase == MAP_FAILED) {
-            LOGE("Failed to mmap %d", task->data_source->mmap_details->fd);
-            continue;
-        }
-
-        const uint8_t* compressedData = (const uint8_t*)mappedSrcBase + task->data_source->offset + (regions ? regions->bufferOffset : 0);
-
-        // Map the destination image's memory to get a CPU-accessible pointer
-        void* mappedDst = nullptr;
-        VkResult mapResult = vkMapMemory((VkDevice) TASK_DEVICE(self), task->image_params->memory, 0, task->image_params->size, 0, &mappedDst);
-        if (mapResult == VK_SUCCESS && mappedDst) {
-            // Determine the block size and decoding function based on the format
-            // The format values are adjusted by subtracting 0x83 (VK_FORMAT_BC1_RGB_UNORM_BLOCK)
-            uint32_t format_id = task->image_params->format - 0x83;
-            uint32_t block_size = 16;
-            if (format_id < 4) {
-                block_size = 8; // BC1
-            }
-            if (format_id == 8 || format_id == 9) {
-                block_size = 8; // BC4
-            }
-
-            int height = regions->imageExtent.height;
-            int width = regions->imageExtent.width;
-
-            // Loop over the image in 4x4 blocks
-            for (int y = regions->imageOffset.y; y < height; y += 4) {
-                for (int x = regions->imageOffset.x; x < width; x += 4) {
-
-                    // Calculate pointer to the destination 4x4 block
-                    void *dstPixelBlock =
-                            (uint8_t *) mappedDst + (y * width * 4) + (x * 4);
-                    int pitch = 4 * regions->bufferRowLength;
-
-                    switch (format_id) {
-                        case 0: // BC1_RGB_UNORM_BLOCK
-                        case 1: // BC1_RGB_SRGB_BLOCK
-                        case 2: // BC1_RGBA_UNORM_BLOCK
-                        case 3: // BC1_RGBA_SRGB_BLOCK
-                            bcdec_bc1(compressedData, dstPixelBlock, pitch);
-                            break;
-
-                        case 4: // BC2_UNORM_BLOCK
-                        case 5: // BC2_SRGB_BLOCK
-                            bcdec_bc2(compressedData, dstPixelBlock, pitch);
-                            break;
-
-                        case 6: // BC3_UNORM_BLOCK
-                        case 7: // BC3_SRGB_BLOCK
-                            bcdec_bc3(compressedData, dstPixelBlock, pitch);
-                            break;
-
-                        case 8: // BC4_UNORM_BLOCK
-                        case 9: // BC4_SNORM_BLOCK
-                            bcdec_bc4(compressedData, dstPixelBlock,
-                                           pitch, format_id == 9);
-                            break;
-
-                        case 10: // BC5_UNORM_BLOCK
-                        case 11: // BC5_SNORM_BLOCK
-                            bcdec_bc5(compressedData, dstPixelBlock,
-                                           pitch, format_id == 11);
-                            break;
-
-                        default:
-                            // Unknown/unsupported format, do nothing.
-                            break;
-                    }
-
-                    // Advance the source pointer to the next block
-                    compressedData += block_size;
-                }
-            }
-        }
-        vkUnmapMemory((VkDevice) TASK_DEVICE(self), task->image_params->memory);
-        munmap(mappedSrcBase, task->data_source->mmap_details->length);
-        free(regions);
-    }
-}
-
 
 // Intercepts vkCreateInstance _between_ Vortek and the underlying libvulkan.so
 // and inject a single VK_LAYER_KHRONOS_validation layer
@@ -649,6 +432,8 @@ int patch_got(char* base_addr, long offset, void** original, void* next) {
     void *page_start = (void *)(((uintptr_t) got_entry) & ~(page_size - 1));
     mprotect(page_start, page_size, PROT_READ | PROT_WRITE);
     *got_entry = (void*) next;
+
+    LOGI("Patching %p+%x from %p to %p", base_addr, offset, *original, next);
     // TODO: reset the protection bits
     return 0;
 }
@@ -664,18 +449,20 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     SAVE(old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext);
     long result = old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext(env, thiz, fd, options);
 
-    int enable_bc = !is_enabled("debug.vt.no_decoder");
-    int enable_logging = is_enabled("debug.vt.logging");
-    int enable_dump_api = is_enabled("debug.vt.dump_api");
+    LOGI("Result: %d", result);
+
+    // int enable_bc = !is_enabled("debug.vt.no_decoder");
+    int enable_logging = is_enabled("debug.vt.logging", "VT_LOGGING");
+    int enable_dump_api = is_enabled("debug.vt.dump_api", "VT_DUMP");
 
     char* base_addr = (char*) findLibraryBase("libvortekrenderer.so");
     // Patch the TextureDecoder_decodeAll, which is at +0x3bb30 from the start of the image
-    if (enable_bc)
-        patch_got(base_addr, 0x3bb30,
-                  (void**) &original_TextureDecoder_decodeAll,
-                  (void*) &my_TextureDecoder_decodeAll);
+    // if (enable_bc)
+    //     patch_got(base_addr, 0x3bb30,
+    //               (void**) &original_TextureDecoder_decodeAll,
+    //               (void*) &my_TextureDecoder_decodeAll);
     if (enable_logging)
-        patch_got(base_addr, 0x3bc68,
+        patch_got(base_addr, 0x484e0,
                   (void**) &original_getHandleRequestFunc,
                   (void*) &my_getHandleRequestFunc);
 
@@ -683,6 +470,12 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     void* vulkanWrapper = dlsym(libvortekrenderer, "vulkanWrapper");
     // The vkCreateInstance pointer is at offset 0x18 from wrapper base
     // e388: str    x0, [x23, #0x18] ; stores the vkCreateInstance symbol from libvulkan at +0x18
+    // .text:0010f464  c1ffffd0        adrp        param_2,0x109000                        
+    // .text:0010f468  21f00e91        add         param_2=>...,param_2,#0x3bc             ;= "vkCreateInstance"
+    // .text:0010f46c  f80300aa        mov         x24,param_1                             
+    // .text:0010f470  a0d80094        bl          .plt:<EXTERNAL>::dlsym                  ;undefined dlsym()
+    // .text:0010f474  c1ffffb0        adrp        param_2,0x108000                        
+    // .text:0010f478  e00e00f9        str         param_1,[x23, #0x18]=>.bss:DAT_00149018 ;= ?? <--
     if (enable_dump_api)
         *(void**)((char*)vulkanWrapper + 0x18) = (void*) &my_vkCreateInstance;
 
@@ -694,9 +487,9 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     *((void**)&original_##sym) = (void*) handleRequestFuncs[index - 100]; \
     handleRequestFuncs[index - 100] = (void*) &my_##sym; }
 
-    if (enable_bc)
-        PATCH(vt_handle_vkCmdCopyBufferToImage, 0xd7);
-    PATCH(vt_handle_vkCmdCopyBufferToImage2, 0x146);
+    // if (enable_bc)
+    //     PATCH(vt_handle_vkCmdCopyBufferToImage, 0xd7);
+    // PATCH(vt_handle_vkCmdCopyBufferToImage2, 0x146);
     if (enable_logging)
         PATCH(vt_handle_vkEndCommandBuffer, 0xbf);
 

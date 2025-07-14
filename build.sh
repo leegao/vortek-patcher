@@ -1,7 +1,7 @@
 APK="$1"
 
 if [ ! -f "$APK" ]; then
-	echo "Please run $0 <PATH_TO_WINLATOR_10.0>.apk"
+	echo "Please run $0 <PATH_TO_WINLATOR_10.1>.apk"
 	exit 1
 fi
 
