@@ -26,6 +26,8 @@ def main(libvortekrenderer):
 
     print("Adding libvortekpatcher.so to DT_NEEDED")
     binary.add_library("libvortekpatcher.so")
+    binary.add_library("libwinlator_10_1.so")
+    binary.remove_library("libwinlator.so")
     binary.write(libvortekrenderer + ".new")
 
 if __name__ == "__main__":

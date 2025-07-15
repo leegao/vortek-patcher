@@ -298,6 +298,46 @@ typedef struct ArrayDeque {
     void** elements;
 } ArrayDeque;
 
+typedef struct VtContext {
+    /* 0x00 */ int socket_fd;                                    // Socket file descriptor for IPC with the client.
+    /* 0x04 */ uint32_t vkMaxVersion;                             // The maximum Vulkan API version supported by the client.
+    /* 0x08 */ uint16_t maxDeviceMemory;                          // Memory limit in GB, from Java.
+    /* 0x0a */ uint16_t imageCacheSize;                           // Image cache size limit in MB, from Java.
+    /* 0x10 */ void* exposedDeviceExtensions;                    // ArrayList of device extension strings to expose.
+    /* 0x18 */ void* exposedInstanceExtensions;                  // ArrayList of instance extension strings to expose.
+    /* 0x20 */ bool isHostVisibleExternalMemoryImportSupported;               // Flag indicating if DMA_BUF with HOST_VISIBLE is supported.
+    /* 0x21 */ bool isDmaBufImportExportSupported;           // Flag indicating if AndroidHardwareBuffer is supported.
+    /* 0x22 */ short field_0x22_padding;                     // Padding.
+    /* 0x24 */ int field_0x24_padding;                     // Padding.
+    /* 0x28 */ void* pRequestData;                               // Pointer to the current command's data buffer.
+    /* 0x30 */ int requestDataSize;                              // Size of the data pointed to by pRequestData.
+    /* 0x34 */ int field_0x34_padding;                     // Padding.
+    /* 0x38 */ void* tempBuffer;                                 // Arena allocator buffer for temporary command data.
+    /* 0x40 */ int tempBufferOffset;                             // Current offset within the tempBuffer.
+    /* 0x44 */ int field_0x44_padding;                     // Padding.
+    /* 0x48 */ void* tempAllocations;                            // ArrayList tracking temporary allocations to be freed.
+    /* 0x50 */ uint64_t field_0x50_padding;                     // Padding.
+    /* 0x58 */ pthread_t workerThread;                           // Handle for the main worker thread processing commands.
+    /* 0x60 */ void* serverRingBuffer;                           // RingBuffer for server-to-client communication.
+    /* 0x68 */ void* clientRingBuffer;                           // RingBuffer for client-to-server communication.
+    /* 0x70 */ int contextStatus;                                // Overall context status (e.g., VK_ERROR_DEVICE_LOST).
+    /* 0x74 */ int graphicsQueueFamilyIndex;                     // The queue family index that supports graphics operations.
+    /* 0x78 */ void* textureDecoder;                             // Pointer to the TextureDecoder context.
+    /* 0x80 */ void* shaderInspector;                            // Pointer to the ShaderInspector context.
+    /* 0x88 */ void* asyncPipelineCreator;                       // Pointer to the AsyncPipelineCreator context.
+    /* 0x90 */ void* jniEnv;                                     // JNI Environment pointer.
+    /* 0x98 */ void* javaRendererComponent;                      // JNI jobject reference to the VortekRendererComponent.
+    /* 0xa0 */ void* getWindowWidth_id;                          // jmethodID for getWindowWidth.
+    /* 0xa8 */ void* getWindowHeight_id;                         // jmethodID for getWindowHeight.
+    /* 0xb0 */ void* getWindowHardwareBuffer_id;                 // jmethodID for getWindowHardwareBuffer.
+    /* 0xb8 */ void* updateWindowContent_id;                     // jmethodID for updateWindowContent.
+    /* 0xc0 */ uint64_t field_0xc0_padding;                     // Padding to 200 bytes.
+} VtContext;
+
+static_assert(offsetof(VtContext, field_0xc0_padding) == 0xc0);
+static_assert(offsetof(VtContext, pRequestData) == 0x28);
+static_assert(offsetof(VtContext, requestDataSize) == 0x30);
+
 static void (*original_TextureDecoder_decodeAll)(void* self);
 static void (*original_vt_handle_vkCmdCopyBufferToImage)(void* ctx);
 static void (*original_vt_handle_vkCmdCopyBufferToImage2)(void* ctx);
@@ -316,39 +356,98 @@ static void (*TextureDecoder_copyBufferToImage)(void*, VkCommandBuffer          
                                            VkImage                                     dstImage,
                                            VkImageLayout                               dstImageLayout);
 
+static void (*original_initVulkanInstance)(long param_1,void* param_2,char *param_3,void* param_4,
+                       void* param_5,void* param_6,void* param_7,void* param_8);
+
 static ArrayDeque image_regions;
+
+#define HOOK(name, ret, params) \
+static ret (*original_##name) params; \
+ret my_##name params
 
 void* my_getHandleRequestFunc(unsigned short op) {
     // if (op == 0x147 || op == 0xbf || op == 0xd8)
     LOGI("Handling command: %d (%s)", op, get_vulkan_call_name(op));
     return original_getHandleRequestFunc(op);
 }
+void my_initVulkanInstance(long param_1,void* param_2,char *param_3,void* param_4,
+                       void* param_5,void* param_6,void* param_7,void* param_8) {
+    LOGI("Inside my_initVulkanInstance");
+    original_initVulkanInstance(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
+}
+
+typedef struct ShaderModuleInfo {
+    VkShaderModule vkShaderModule;  // The Vulkan handle for the compiled shader module.
+                                    // Stored at offset 0x00.
+    void*          pShaderCode;     // Pointer to the raw SPIR-V or binary shader code data.
+                                    // This memory is dynamically allocated and copied.
+                                    // Stored at offset 0x08.
+    size_t         shaderCodeSize;  // The size of the raw shader code data in bytes.
+                                    // Stored at offset 0x10.
+    // Based on assembly, the total size of this struct is 0x20 bytes (32 bytes).
+    // The remaining 8 bytes after `shaderCodeSize` are used for internal flags.
+    bool           isValid;                  // A flag indicating if the shader module creation was successful.
+                                    // Set to 0 (false) initially, then potentially to 1 (true) on success.
+                                    // Stored at offset 0x18 (byte 0).
+    bool           isOwnedByShaderInspector; // A flag likely indicating if this ShaderModuleInfo instance
+                                    // and its associated pShaderCode should be freed by the ShaderInspector.
+                                    // Stored at offset 0x19 (byte 1).
+    char           _padding[6];     // Padding bytes to ensure struct size is 0x20 bytes (32 bytes)
+} ShaderModuleInfo;
+
+typedef struct ShaderInspector {
+    /* 0x00 */ bool noShaderClipDistance;        // True if VK_KHR_shader_clip_distance is NOT supported (or explicitly disabled).
+                                                      // Derived from VkPhysicalDeviceFeatures::shaderClipDistance.
+    /* 0x01 */ bool noScaledVertexBufferConversion; // True if VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT is NOT supported for VK_FORMAT_R8G8B8A8_SSCALED.
+                                                      // Indicates if a fallback for scaled vertex buffer formats is needed.
+    /* 0x02 */ bool isMaliDevice;                     // True if "Mali" substring is found in the physical device name.
+    /* 0x03 */ bool initialized;                      // Always true; indicates the struct has been initialized.
+} ShaderInspector;
+
+
+HOOK(ShaderInspector_inspectShaderStages, VkResult, 
+    (ShaderInspector *param_1,void* param_2,long param_3,uint param_4,VkPipelineVertexInputStateCreateInfo* param_5,long param_6,
+              void* param_7,void* param_8)) {
+    LOGI("Inside ShaderInspector_inspectShaderStages");
+    LOGI("  + noShaderClipDistance = %d", param_1->noShaderClipDistance);
+    LOGI("  + noScaledVertexBufferConversion = %d", param_1->noScaledVertexBufferConversion);
+    LOGI("  + isMaliDevice = %d", param_1->isMaliDevice);
+    LOGI("  + initialized = %d", param_1->initialized);
+    // param_1->noScaledVertexBufferConversion = 0;
+    LOGI("param_5: %p", param_5);
+    LOGI("  + sType: %x", param_5->sType);
+    LOGI("  + pNext: %p", param_5->pNext);
+    LOGI("  + flags: %x", param_5->flags);
+    LOGI("  + vertexBindingDescriptionCount: %d", param_5->vertexBindingDescriptionCount);
+    LOGI("  + pVertexBindingDescriptions: %p", param_5->pVertexBindingDescriptions);
+    LOGI("  + vertexAttributeDescriptionCount: %d", param_5->vertexAttributeDescriptionCount);
+    LOGI("  + pVertexAttributeDescriptions: %p", param_5->pVertexAttributeDescriptions);
+    return original_ShaderInspector_inspectShaderStages(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
+}
 
 extern "C"
-void my_vt_handle_vkEndCommandBuffer(void* ctx) {
+void my_vt_handle_vkEndCommandBuffer(VtContext* ctx) {
     // Log every command on the buffer
-    // LOGI("Inside vt_handle_vkEndCommandBuffer");
-#define GET(x) (*(void**)(x))
-    char* context = (char*) ctx;
-    uint8_t* commandBuffer = (uint8_t*) GET(context + 0x50);  // offset 0x50
+// #define GET(x) (*(void**)(x))
+//     char* context = (char*) ctx;
+//     uint8_t* commandBuffer = (uint8_t*) GET(context + 0x28);  // offset 0x50
+//     int totalBufferSize = (long) GET(context + 0x30);  // offset 0x58
 
-    // Get total size of command buffer
-    int totalBufferSize = (long) GET(context + 0x58);  // offset 0x58
-
-    // Process commands if buffer has more than 8 bytes
-    if (totalBufferSize > 8) {
-        int currentOffset = 8;  // Skip the initial 8-byte header
-        do {
-            // Get pointer to current command
-            auto commandPtr = (uint32_t*)(commandBuffer + currentOffset);
-            // Read command ID and size
-            auto commandId = commandPtr[0];
-            auto commandSize = commandPtr[1];
-            LOGI("  + commandId: %d (%s), commandSize: %d", commandId, get_vulkan_call_name(commandId), commandSize);
-            // Move to next command (skip command header + command data)
-            currentOffset += commandSize + 8;
-        } while (currentOffset < totalBufferSize);
-    }
+//     // Process commands if buffer has more than 8 bytes
+//     if (totalBufferSize > 8) {
+//         LOGI("Inside vt_handle_vkEndCommandBuffer with totalBufferSize: %d", totalBufferSize);
+//         int currentOffset = 8;  // Skip the initial 8-byte header
+//         do {
+//             // Get pointer to current command
+//             auto commandPtr = (uint32_t*)(commandBuffer + currentOffset);
+//             // Read command ID and size
+//             auto commandId = commandPtr[0];
+//             auto commandSize = commandPtr[1];
+//             LOGI("  + commandId: %d (%s), commandSize: %d", commandId, get_vulkan_call_name(commandId), commandSize);
+//             // Move to next command (skip command header + command data)
+//             currentOffset += commandSize + 8;
+//         } while (currentOffset < totalBufferSize);
+//     }
 
     original_vt_handle_vkEndCommandBuffer(ctx);
 }
@@ -433,7 +532,7 @@ int patch_got(char* base_addr, long offset, void** original, void* next) {
     mprotect(page_start, page_size, PROT_READ | PROT_WRITE);
     *got_entry = (void*) next;
 
-    LOGI("Patching %p+%x from %p to %p", base_addr, offset, *original, next);
+    LOGI("Patching %p+%lx from %p to %p", base_addr, offset, *original, next);
     // TODO: reset the protection bits
     return 0;
 }
@@ -449,22 +548,24 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     SAVE(old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext);
     long result = old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext(env, thiz, fd, options);
 
-    LOGI("Result: %d", result);
+    LOGI("Result: %ld", result);
 
     // int enable_bc = !is_enabled("debug.vt.no_decoder");
-    int enable_logging = is_enabled("debug.vt.logging", "VT_LOGGING");
+    // int enable_logging = is_enabled("debug.vt.logging", "VT_LOGGING");
     int enable_dump_api = is_enabled("debug.vt.dump_api", "VT_DUMP");
 
     char* base_addr = (char*) findLibraryBase("libvortekrenderer.so");
-    // Patch the TextureDecoder_decodeAll, which is at +0x3bb30 from the start of the image
-    // if (enable_bc)
-    //     patch_got(base_addr, 0x3bb30,
-    //               (void**) &original_TextureDecoder_decodeAll,
-    //               (void*) &my_TextureDecoder_decodeAll);
-    if (enable_logging)
-        patch_got(base_addr, 0x484e0,
-                  (void**) &original_getHandleRequestFunc,
-                  (void*) &my_getHandleRequestFunc);
+#define GOT(func, addr) \
+    patch_got(base_addr, addr, (void**) &original_##func, (void*) &my_##func)
+    // 0000000482a8  010c00000402 R_AARCH64_JUMP_SL 000000000003264c initVulkanInstance + 0
+    // 000000048310  00cb00000402 R_AARCH64_JUMP_SL 0000000000033b10 initVulkanDevice + 0
+    GOT(initVulkanInstance, 0x482a8);
+    // 0000000000048620  000000b100000402 R_AARCH64_JUMP_SLOT    0000000000041f64 ShaderInspector_inspectShaderStages + 0
+    GOT(ShaderInspector_inspectShaderStages, 0x48620);
+    // if (enable_logging)
+    //     patch_got(base_addr, 0x484e0,
+    //               (void**) &original_getHandleRequestFunc,
+    //               (void*) &my_getHandleRequestFunc);
 
     // Calculate the actual address of the cache vkCreateInstance pointer within Vortek
     void* vulkanWrapper = dlsym(libvortekrenderer, "vulkanWrapper");
@@ -487,11 +588,8 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     *((void**)&original_##sym) = (void*) handleRequestFuncs[index - 100]; \
     handleRequestFuncs[index - 100] = (void*) &my_##sym; }
 
-    // if (enable_bc)
-    //     PATCH(vt_handle_vkCmdCopyBufferToImage, 0xd7);
-    // PATCH(vt_handle_vkCmdCopyBufferToImage2, 0x146);
-    if (enable_logging)
-        PATCH(vt_handle_vkEndCommandBuffer, 0xbf);
+    // if (enable_logging)
+    //     PATCH(vt_handle_vkEndCommandBuffer, 0xbf);
 
     SAVE(VkObject_fromId);
     SAVE(TextureDecoder_containsImage);
