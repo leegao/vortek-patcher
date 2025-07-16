@@ -342,7 +342,6 @@ static void (*original_TextureDecoder_decodeAll)(void* self);
 static void (*original_vt_handle_vkCmdCopyBufferToImage)(void* ctx);
 static void (*original_vt_handle_vkCmdCopyBufferToImage2)(void* ctx);
 static void (*original_vt_handle_vkEndCommandBuffer)(void* ctx);
-static void* (*original_getHandleRequestFunc)(unsigned short);
 
 static long (*old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext)(JNIEnv* env, jobject thiz, int fd, jobject options);
 static int (*ArrayDeque_isEmpty)(void* deque);
@@ -356,22 +355,20 @@ static void (*TextureDecoder_copyBufferToImage)(void*, VkCommandBuffer          
                                            VkImage                                     dstImage,
                                            VkImageLayout                               dstImageLayout);
 
-static void (*original_initVulkanInstance)(long param_1,void* param_2,char *param_3,void* param_4,
-                       void* param_5,void* param_6,void* param_7,void* param_8);
-
 static ArrayDeque image_regions;
 
 #define HOOK(name, ret, params) \
 static ret (*original_##name) params; \
 ret my_##name params
 
-void* my_getHandleRequestFunc(unsigned short op) {
+HOOK(getHandleRequestFunc, void*, (unsigned short op)) {
     // if (op == 0x147 || op == 0xbf || op == 0xd8)
     LOGI("Handling command: %d (%s)", op, get_vulkan_call_name(op));
     return original_getHandleRequestFunc(op);
 }
-void my_initVulkanInstance(long param_1,void* param_2,char *param_3,void* param_4,
-                       void* param_5,void* param_6,void* param_7,void* param_8) {
+
+HOOK(initVulkanInstance, void, (long param_1,void* param_2,char *param_3,void* param_4,
+                       void* param_5,void* param_6,void* param_7,void* param_8)) {
     LOGI("Inside my_initVulkanInstance");
     original_initVulkanInstance(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
 }
@@ -423,6 +420,12 @@ HOOK(ShaderInspector_inspectShaderStages, VkResult,
     LOGI("  + vertexAttributeDescriptionCount: %d", param_5->vertexAttributeDescriptionCount);
     LOGI("  + pVertexAttributeDescriptions: %p", param_5->pVertexAttributeDescriptions);
     return original_ShaderInspector_inspectShaderStages(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
+}
+
+HOOK(ShaderInspector_createModule, void*,
+               (ShaderInspector* si, VkDevice device, const uint32_t *spirv, size_t spirvSize, ShaderModuleInfo **out)) {
+    LOGI("Inside ShaderInspector_createModule");
+    return original_ShaderInspector_createModule(si, device, spirv, spirvSize, out);
 }
 
 extern "C"
@@ -520,7 +523,12 @@ void* findLibraryBase(const std::string& library_name) {
 
 int patch_got(char* base_addr, long offset, void** original, void* next) {
     void** got_entry = (void**) &base_addr[offset];
-    *original = *got_entry;
+    if (*original == *got_entry || *got_entry == next) {
+        LOGI("Not patching - GOT already points to next. *got: %p, *original: %p, next: %p", *got_entry, *original, next);
+        return 0;
+    } else {
+        *original = *got_entry;
+    }
 
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size == -1) {
@@ -550,7 +558,6 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
 
     LOGI("Result: %ld", result);
 
-    // int enable_bc = !is_enabled("debug.vt.no_decoder");
     // int enable_logging = is_enabled("debug.vt.logging", "VT_LOGGING");
     int enable_dump_api = is_enabled("debug.vt.dump_api", "VT_DUMP");
 
@@ -562,6 +569,8 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     GOT(initVulkanInstance, 0x482a8);
     // 0000000000048620  000000b100000402 R_AARCH64_JUMP_SLOT    0000000000041f64 ShaderInspector_inspectShaderStages + 0
     GOT(ShaderInspector_inspectShaderStages, 0x48620);
+    // 0000000000048388  0000013500000402 R_AARCH64_JUMP_SLOT    0000000000041cbc ShaderInspector_createModule + 0
+    GOT(ShaderInspector_createModule, 0x48388);
     // if (enable_logging)
     //     patch_got(base_addr, 0x484e0,
     //               (void**) &original_getHandleRequestFunc,
